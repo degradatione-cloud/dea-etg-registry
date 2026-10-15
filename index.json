@@ -1,0 +1,53 @@
+{
+ "v": 1,
+ "plugins": [
+  {
+   "id": "ayanami_letters",
+   "name": "Ayanami Letters",
+   "version": "1.0.2",
+   "file": "plugins/ayanami_letters.plugin",
+   "sha256": "97c63735e8324a68b94c8004738a8213e89599a42e3f0cda03255d3229a898fb",
+   "sig": "eKRTAhv/GrMCBaffYvqRbiV3Wi24Q4qdaj0avUT9W5vBtQf44w8eX+92rDhQOqpb/cmuf7Jp/9IPGCKRGRTd79dtHwggik0nRw62QBdoUNXEtqlqK946mwBIeIp/t3ePSLkvVaYs4Ho2lunMvV03P0sApUEgX36rP8L7eya7uanJoJFSYqnzGPx6TiItSD1kkuxesDYuZ1g2geg1YbGAFjeez0I0x5xmo4CmgN77mRmhRAn4qYudgf3fLGZ+Vd7KWIMVx676CuVGPKIHbIob/D8VIK9jSmEjmCTtqqJ09rQ0eCXwTV9XiT7kGWRF7V9ezaPbyIio3hnKBIvKAuhzYw=="
+  },
+  {
+   "id": "circle_send",
+   "name": "Circle Send",
+   "version": "1.0.1",
+   "file": "plugins/circle_send.plugin",
+   "sha256": "76dbebdd0b228baaa24d5f345b4d2a147236b3313f5cf1e314038edeef38fb37",
+   "sig": "kNjte1So8TgF5MgCsbgwQeYRCAaiiY9HHQT24vhn0KqSyTNvOJH1kvtObakszDOUeZ2WZgfCu/Fjh/0enEBYnSmK5l8yGRf5eWprVPwXPWhLG6Mce40qErnG9V+GtU5KGrfRjuwmurlPGu2S0leHPaDqhIZOssBKETYEqEL86ivZPd38Der4AovO0hSnS3ZyP/F5/Uv9ih+rApzVfrNufITq24RaNq5Dk7IEDbXg+6Ql/oO67hv3IYSz9hgozaFnonOuDgPEr5gvOmcXIz3ABHc9H7EttemayF4QKh3oKqY+CtnGxJLrHia7jMpKXAq1rpB27JLoeBXCXqsc5KmMjQ=="
+  },
+  {
+   "id": "web_shortcut_pill",
+   "name": "Web Shortcut Pill",
+   "version": "3.1.0",
+   "file": "plugins/web_shortcut_pill.plugin",
+   "sha256": "62be68ff9026804a93f771fdae4248f9c173d842efb5fa7f6d62df6e7d569518",
+   "sig": "Cc6dqqGI4Ht5y0F/GT73MD91zjrFjhA6nVP0aRvfA1do1ciYY3t7wTyLejJPSmrpIV0/HWt/XydDPVSgRjvMNhJW4g7+KX/beVkuKRWP5FoL43qFxLXKffRzkvol8G9Txw8FG5mqJP50fXYreC9fwYieZ4RJ2td8PHVaobYXtvIUfc3wjanUTvQJBwk0Ldjmzmy4EmUwwroLhLBX4Ryl0TkybFSfkAbkX6PJAAdfNuaHq8ChHGUytYLaNSsI+OQtCSAiVqyzWyxGJnM8rAXfPpp9x7ZujwDNupbbwvzkfZ96Us/o7Ro/3GMGUYBGnlkfT+HT6T8UrU7DqJ225IUzmQ=="
+  },
+  {
+   "id": "anti_delete",
+   "name": "Anti-Delete",
+   "version": "1.0.0",
+   "file": "plugins/anti_delete.plugin",
+   "sha256": "cd382a3a857b9a1cc00cb51daec6e2a5a84d6933d81e70ca3872684316f13da3",
+   "sig": "lqGd7PR70K9VfMM10QSkWj5igijcGxY1XqUqk9ralCkI6iMTSCxiUjAaer8fMJm+E6+nmzC6I1jBTFNgdaHTzr3UYgcspqymx7+9GsnNdox/H81/aLG7rbnSJ3OOADYXncrcVlIxpX+vAq2eS/2Jh82Lgbydug1/EJSkFpKNCV0XN5b/ELJU7GBfmbaDAavHn9qpc9+08oMIQVl95R0Z5+QZkVj3Bgh9SSnD08srRHwurqUR90WR10ujA1+kAJ6FvgrE5D/j63FRinNenvQvYVbGE8YQvtN2K1FZiSOQBllbADpUqj7v6J0UvyJ5inEEFP/TnT2jDo3a4ZDyoQ9rug=="
+  },
+  {
+   "id": "sticker_grab",
+   "name": "Sticker Grab",
+   "version": "1.0.0",
+   "file": "plugins/sticker_grab.plugin",
+   "sha256": "bab3fdbb05ed187d91c4c41514b3d7aa61591b97b85d853a8e0a916ed4dd2db1",
+   "sig": "rGd/6ElgOMMZta6tVsybngKvuB60tLZYY+phK6K832QEz/7Vf1Xs7E6I1sAFkWRrFkt8AEp2TbLPRQB4tB7Z2J46mRJNR22+J6I3WGexdI0WExykEgwyZi7QlmHVKKgMiNNz9bnTDvVXW0JEruNYwP1ucmuq6avsAzl9zQoB/Z/7fHKb2Us6qk164dav60ALuUcaD9c7aeJ15Wm4tdgEepCnd+YlujjnsEVoebjk2CszJmP6YVsUf+EsxvNkZHUYjBFynNEBrHop2iNQ0Y5nqV0TadNW5TUZ5lLlmeihQ6OnJB4ENsORnA10lkXUE32LXi0HaFeaF5c89PtnRc13PQ=="
+  },
+  {
+   "id": "mogg_replace",
+   "name": "Mogg Replace",
+   "version": "1.0.1",
+   "file": "plugins/mogg_replace.plugin",
+   "sha256": "9019fe2b9e4acd514edd67aa4d06f6a0913ac87318a3744cd00ee1737595c1be",
+   "sig": "kt4xRu2lOtBF7a4wt1sfyQk0QyrRRnh1GuCRL+vGfOsjRhJi5gpEGPE1LV5O6SAxauKU1InObcl0J3n9IbEQpggqA5IUjEsK6q7sMYNt3JmGpVV+qxWIJ4ne47G34FQYKRgNl5rnPrWaZeNgmek8/PKnTtIgLhtUtUhS1C2tu6JQ9r5sHbawqeZCybYxX+NOAkq0g5onXFQwFIPeGLwutlqCRSqDNAsr1jwgtte2BYPR+4WSv5HoUQmpNjiTnLeF9A6Jqc2wQMBEGZnP3ghiVATPSu6Azb0Cl9jPI/CMe1z5mmSvR3Y0yFolARyxZ4CTMDmZ7EOzywI3gAsI9IhgXg=="
+  }
+ ]
+}

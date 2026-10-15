@@ -1,0 +1,198 @@
+__id__ = "mogg_replace"
+__name__ = "Mogg Replace"
+__description__ = "Локально заменяет «мог», «Могг» и любые вхождения внутри слов на mogg."
+__author__ = "@progrressiya | @Kanyon_e"
+__version__ = "1.0.1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.0"
+
+import bisect
+import re
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Header, Divider, Switch
+from java.util import ArrayList
+
+REPL = "mogg"
+WORD_RE = re.compile(r"могг?", re.IGNORECASE | re.UNICODE)
+
+_plugin = None
+
+try:
+    TL_messageEntityCustomEmoji = find_class("org.telegram.tgnet.TLRPC$TL_messageEntityCustomEmoji")
+except Exception:
+    TL_messageEntityCustomEmoji = None
+
+
+def _u16(s):
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _transform(msg):
+    if msg is None:
+        return False
+    text = getattr(msg, "message", None)
+    if not text:
+        return False
+    s = str(text)
+    if not WORD_RE.search(s):
+        return False
+    if _plugin is not None:
+        try:
+            if not _plugin.get_setting("enabled", True):
+                return False
+        except Exception:
+            pass
+
+    old_start = []
+    new_start = []
+    out = []
+    new_pos = 0
+    units = 0
+    idx = 0
+    for m in WORD_RE.finditer(s):
+        start, end = m.start(), m.end()
+        while idx < start:
+            ch = s[idx]
+            clen = 2 if ord(ch) > 0xFFFF else 1
+            old_start.append(units)
+            new_start.append(new_pos)
+            out.append(ch)
+            new_pos += clen
+            units += clen
+            idx += 1
+        matched = s[start:end]
+        old_start.append(units)
+        new_start.append(new_pos)
+        out.append(REPL)
+        units += _u16(matched)
+        new_pos += _u16(REPL)
+        idx = end
+    while idx < len(s):
+        ch = s[idx]
+        clen = 2 if ord(ch) > 0xFFFF else 1
+        old_start.append(units)
+        new_start.append(new_pos)
+        out.append(ch)
+        new_pos += clen
+        units += clen
+        idx += 1
+
+    total_old = units
+    total_new = new_pos
+
+    def map_start(b):
+        if b <= 0:
+            return 0
+        if b >= total_old:
+            return total_new
+        i = bisect.bisect_right(old_start, b) - 1
+        return new_start[i]
+
+    def map_end(e):
+        if e >= total_old:
+            return total_new
+        i = bisect.bisect_right(old_start, e) - 1
+        if old_start[i] == e:
+            return new_start[i]
+        j = i + 1
+        return new_start[j] if j < len(new_start) else total_new
+
+    ents = getattr(msg, "entities", None)
+    if ents is None:
+        ents = ArrayList()
+        msg.entities = ents
+
+    try:
+        size = ents.size()
+    except Exception:
+        size = 0
+
+    for i in range(size):
+        try:
+            e = ents.get(i)
+            o = int(e.offset)
+            l = int(e.length)
+            no = map_start(o)
+            ne = map_end(o + l)
+            if ne < no:
+                ne = no
+            e.offset = no
+            e.length = ne - no
+        except Exception:
+            pass
+
+    msg.message = "".join(out)
+    return True
+
+
+class _CtorHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) < 2:
+                return
+            _transform(args[1])
+        except Exception:
+            pass
+
+
+class _UpdateHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            _transform(getattr(param.thisObject, "messageOwner", None))
+        except Exception:
+            pass
+
+
+class MoggReplacePlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        global _plugin
+        _plugin = self
+        cls = find_class("org.telegram.messenger.MessageObject")
+        if cls is None:
+            self.log("mogg: MessageObject not found")
+            return
+        try:
+            java_cls = cls.getClass()
+        except Exception:
+            java_cls = cls
+        self._unhooks = []
+        try:
+            lst = self.hook_all_constructors(java_cls, _CtorHook())
+            if lst:
+                self._unhooks.extend(lst)
+        except Exception as e:
+            self.log("mogg: ctor hook error: %s" % e)
+        for name in ("updateMessageText", "applyNewText"):
+            try:
+                lst = self.hook_all_methods(java_cls, name, _UpdateHook())
+                if lst:
+                    self._unhooks.extend(lst)
+            except Exception:
+                pass
+        self.log("mogg: loaded (%d hooks)" % len(self._unhooks))
+
+    def on_plugin_unload(self):
+        global _plugin
+        _plugin = None
+        for h in getattr(self, "_unhooks", []):
+            try:
+                self.unhook_method(h)
+            except Exception:
+                pass
+        self._unhooks = []
+
+    def create_settings(self):
+        return [
+            Header(text="Mogg Replace"),
+            Switch(
+                key="enabled",
+                text="Включить замену",
+                default=True,
+                icon="msg_text",
+            ),
+            Divider(text="v%s" % __version__),
+        ]

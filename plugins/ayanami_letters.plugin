@@ -1,0 +1,260 @@
+__id__ = "ayanami_letters"
+__name__ = "Ayanami Letters"
+__description__ = "Локально заменяет каждую букву в сообщениях на кастомные эмодзи из пака ayanamirei_emoji."
+__author__ = "@rz3nx & Himiko"
+__version__ = "1.0.2"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.0"
+
+import bisect
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Header, Divider, Switch
+from java.util import ArrayList
+
+EMOJIS = [
+    (6005748066731170967, "🤙"),
+    (6017345938719251806, "😭"),
+    (6016839347326688218, "✋"),
+    (6017265524046568887, "🥹"),
+    (6017339951534840854, "🤡"),
+    (6044256610363120700, "🔥"),
+    (6041769459226516451, "🤦‍♂️"),
+    (6042026865206501322, "🍽️"),
+    (5778625179596889789, "🤡"),
+    (5810108367913360444, "👩‍💻"),
+    (5778368301897883316, "🧏‍♂️"),
+    (5778361949641253519, "🤔"),
+    (5807511677930839133, "👅"),
+    (5810000770392661428, "🤬"),
+    (5839415927661140281, "🫣"),
+    (5837027045376271166, "💸"),
+    (5875457497912843948, "😎"),
+    (5895273776936918705, "🍟"),
+    (5897746492688441119, "🎰"),
+    (5895250085897313627, "🎰"),
+    (5899977105428455022, "🧙‍♂️"),
+    (5823440285702562232, "😇"),
+    (5823601342681194393, "🩷"),
+    (5859324131870253592, "😴"),
+    (5861958926802624670, "😈"),
+    (5861582172271419678, "🚶"),
+    (5882166189584556265, "🍟"),
+]
+
+_plugin = None
+
+try:
+    TL_messageEntityCustomEmoji = find_class("org.telegram.tgnet.TLRPC$TL_messageEntityCustomEmoji")
+except Exception:
+    TL_messageEntityCustomEmoji = None
+
+
+def _u16(s):
+    return len(s.encode("utf-16-le")) // 2
+
+
+class _FakeEntity(object):
+    def __init__(self, offset, length):
+        self.offset = offset
+        self.length = length
+
+
+class _FakeMsg(object):
+    def __init__(self, text, entities=None):
+        self.message = text
+        self.entities = entities
+
+
+def _pick(ch, counter, random_mode):
+    if random_mode:
+        return EMOJIS[(counter * 7 + ord(ch) * 3) % len(EMOJIS)]
+    return EMOJIS[ord(ch) % len(EMOJIS)]
+
+
+def _transform(msg):
+    if msg is None or TL_messageEntityCustomEmoji is None:
+        return False
+    text = getattr(msg, "message", None)
+    if not text:
+        return False
+    s = str(text)
+    if not any(ch.isalpha() for ch in s):
+        return False
+
+    random_mode = False
+    if _plugin is not None:
+        try:
+            if not _plugin.get_setting("enabled", True):
+                return False
+            random_mode = bool(_plugin.get_setting("random_mode", False))
+        except Exception:
+            pass
+
+    old_start = []
+    new_start = []
+    out = []
+    new_ents = []
+    new_pos = 0
+    units = 0
+    counter = 0
+
+    for ch in s:
+        clen = 2 if ord(ch) > 0xFFFF else 1
+        old_start.append(units)
+        new_start.append(new_pos)
+        if ch.isalpha():
+            doc_id, alt = _pick(ch, counter, random_mode)
+            counter += 1
+            alen = _u16(alt)
+            out.append(alt)
+            new_ents.append((new_pos, alen, doc_id))
+            new_pos += alen
+        else:
+            out.append(ch)
+            new_pos += clen
+        units += clen
+
+    total_old = units
+    total_new = new_pos
+
+    def map_start(b):
+        if b <= 0:
+            return 0
+        if b >= total_old:
+            return total_new
+        i = bisect.bisect_right(old_start, b) - 1
+        if old_start[i] == b:
+            return new_start[i]
+        return new_start[i]
+
+    def map_end(e):
+        if e >= total_old:
+            return total_new
+        i = bisect.bisect_right(old_start, e) - 1
+        if old_start[i] == e:
+            return new_start[i]
+        j = i + 1
+        return new_start[j] if j < len(new_start) else total_new
+
+    ents = getattr(msg, "entities", None)
+    if ents is None:
+        ents = ArrayList()
+        msg.entities = ents
+
+    try:
+        size = ents.size()
+    except Exception:
+        size = 0
+
+    for i in range(size):
+        try:
+            e = ents.get(i)
+            o = int(e.offset)
+            l = int(e.length)
+            no = map_start(o)
+            ne = map_end(o + l)
+            if ne < no:
+                ne = no
+            e.offset = no
+            e.length = ne - no
+        except Exception:
+            pass
+
+    for (off, ln, did) in new_ents:
+        try:
+            ent = TL_messageEntityCustomEmoji()
+            ent.offset = off
+            ent.length = ln
+            ent.document_id = did
+            ents.add(ent)
+        except Exception:
+            pass
+
+    msg.message = "".join(out)
+    return True
+
+
+class _CtorHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            args = param.args
+            if args is None or len(args) < 2:
+                return
+            _transform(args[1])
+        except Exception:
+            pass
+
+
+class _UpdateHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            _transform(getattr(param.thisObject, "messageOwner", None))
+        except Exception:
+            pass
+
+
+class AyanamiLettersPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        global _plugin
+        _plugin = self
+
+        cls = find_class("org.telegram.messenger.MessageObject")
+        if cls is None:
+            self.log("ayanami: MessageObject not found")
+            return
+        try:
+            java_cls = cls.getClass()
+        except Exception:
+            java_cls = cls
+
+        self._unhooks = []
+        try:
+            lst = self.hook_all_constructors(java_cls, _CtorHook())
+            if lst:
+                self._unhooks.extend(lst)
+                self.log("ayanami: hooked %d MessageObject constructors" % len(lst))
+        except Exception as e:
+            self.log("ayanami: ctor hook error: %s" % e)
+
+        for name in ("updateMessageText", "applyNewText"):
+            try:
+                lst = self.hook_all_methods(java_cls, name, _UpdateHook())
+                if lst:
+                    self._unhooks.extend(lst)
+            except Exception:
+                pass
+
+        if TL_messageEntityCustomEmoji is None:
+            self.log("ayanami: TL_messageEntityCustomEmoji not found")
+
+    def on_plugin_unload(self):
+        global _plugin
+        _plugin = None
+        for h in getattr(self, "_unhooks", []):
+            try:
+                self.unhook_method(h)
+            except Exception:
+                pass
+        self._unhooks = []
+
+    def create_settings(self):
+        return [
+            Header(text="Ayanami Letters"),
+            Switch(
+                key="enabled",
+                text="Включить замену",
+                default=True,
+                icon="msg_text",
+            ),
+            Switch(
+                key="random_mode",
+                text="Случайный эмодзи на букву",
+                default=False,
+                subtext="Выкл: одна и та же буква всегда один эмодзи. Вкл: перемешано.",
+                icon="msg_dice",
+            ),
+            Divider(text="v%s" % __version__),
+        ]

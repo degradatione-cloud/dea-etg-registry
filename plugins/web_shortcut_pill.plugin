@@ -1,0 +1,877 @@
+__id__ = "web_shortcut_pill"
+__name__ = "Web Shortcut Pill"
+__author__ = "@Degradation_e"
+__version__ = "3.1.0"
+__description__ = "Многостраничный виджет: свайпами листает сохранённые сайты, показывает иконку/текст и открывает ссылку."
+__icon__ = "sPluginIDE/26"
+__min_version__ = "12.5.1"
+
+import json
+import os
+import threading
+import time
+import traceback
+import urllib.request
+import uuid
+import weakref
+from urllib.parse import urlparse
+from typing import Any, Dict, List
+
+from java import dynamic_proxy, jint
+
+from android.graphics import Bitmap, BitmapFactory, Canvas, Paint
+from android.graphics.drawable import GradientDrawable
+from android.view import Gravity, MotionEvent, View
+from android.util import TypedValue
+from android.widget import EditText, LinearLayout, ScrollView, TextView
+
+from android_utils import run_on_ui_thread
+from org.telegram.messenger import AndroidUtilities, R
+from org.telegram.messenger.browser import Browser
+from org.telegram.ui.ActionBar import BottomSheet, Theme
+from org.telegram.ui.Components import LayoutHelper
+
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment, run_on_queue
+from hook_utils import find_class, get_private_field
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Text
+
+FAVICON_ENDPOINT = "https://icons.duckduckgo.com/ip3/{host}.ico"
+PILL_ID = 93001
+AI_PILL_TAG_KEY = jint(0x60A11001)
+TOUCH_TAG_KEY = jint(0x60A11002)
+SUBTITLE_TAG_KEY = jint(0x60A11003)
+
+
+class WebShortcutPillPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._hooks: List[Any] = []
+        self._loaded = False
+        self.active_pills = weakref.WeakSet()
+        self._favicon_cache: Dict[str, Bitmap] = {}
+        self._favicon_lock = threading.Lock()
+        self._favicon_fetching = set()
+        self._last_activity = None
+        self._load_preferences()
+
+        self.ApplicationLoader = find_class("org.telegram.messenger.ApplicationLoader")
+        self.PillRegistry = find_class("com.exteragram.messenger.pillstack.core.PillRegistry")
+        self.PillInfo = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillInfo")
+        self.PillCreator = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillCreator")
+        self.PillStackConfig = find_class("com.exteragram.messenger.pillstack.core.PillStackConfig")
+        self.WeatherPill = find_class("com.exteragram.messenger.pillstack.ui.pills.weather.WeatherPill")
+        self.PluginsController = find_class("com.exteragram.messenger.plugins.PluginsController")
+        self.PluginSettingsActivity = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+
+    def _default_sites(self) -> List[Dict[str, str]]:
+        return [
+            {
+                "id": uuid.uuid4().hex,
+                "title": "Telegram",
+                "url": "https://telegram.org",
+            },
+            {
+                "id": uuid.uuid4().hex,
+                "title": "OpenAI",
+                "url": "https://openai.com",
+            },
+        ]
+
+    def _load_preferences(self):
+        try:
+            raw = self.get_setting("sites_json", "") or ""
+            data = json.loads(raw) if raw else []
+            self.sites = [self._normalize_site(item) for item in data if isinstance(item, dict)]
+        except Exception:
+            self.sites = []
+        if not self.sites:
+            self.sites = self._default_sites()
+            self._save_sites()
+
+        disk_sites = self._load_sites_from_disk()
+        if disk_sites:
+            self.sites = disk_sites
+
+        self.current_site_id = str(self.get_setting("current_site_id", self.sites[0]["id"]))
+        if not any(site["id"] == self.current_site_id for site in self.sites):
+            self.current_site_id = self.sites[0]["id"]
+        self.show_icon = bool(self.get_setting("show_icon", True))
+        self.show_title = bool(self.get_setting("show_title", True))
+        self.show_subtitle = bool(self.get_setting("show_subtitle", False))
+
+    def _normalize_site(self, data: Dict[str, Any]) -> Dict[str, str]:
+        title = str(data.get("title") or data.get("name") or "Website").strip()
+        url = str(data.get("url") or data.get("link") or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            url = f"https://{url}"
+        return {
+            "id": str(data.get("id") or uuid.uuid4().hex),
+            "title": title or urlparse(url).hostname or "Website",
+            "url": url,
+        }
+
+    def _save_sites(self):
+        serializable = [{"id": s["id"], "title": s["title"], "url": s["url"]} for s in self.sites]
+        self.set_setting("sites_json", json.dumps(serializable, ensure_ascii=False))
+        self._persist_sites_to_disk()
+
+    def _storage_path(self):
+        if hasattr(self, "_sites_storage_path") and self._sites_storage_path:
+            return self._sites_storage_path
+        try:
+            files_dir = self.ApplicationLoader.applicationContext.getFilesDir()
+            base = files_dir.getAbsolutePath() if hasattr(files_dir, "getAbsolutePath") else str(files_dir)
+        except Exception as e:
+            self.log(f"[ShortcutPill] filesDir error: {e}")
+            base = None
+        if not base:
+            self._sites_storage_path = None
+            return None
+        storage_dir = os.path.join(base, "web_shortcut_pill")
+        try:
+            os.makedirs(storage_dir, exist_ok=True)
+        except Exception as e:
+            self.log(f"[ShortcutPill] storage mkdir error: {e}")
+        self._sites_storage_path = os.path.join(storage_dir, "links.json")
+        return self._sites_storage_path
+
+    def _load_sites_from_disk(self):
+        path = self._storage_path()
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return [self._normalize_site(item) for item in data if isinstance(item, dict)]
+        except Exception as e:
+            self.log(f"[ShortcutPill] read storage error: {e}")
+            return None
+
+    def _persist_sites_to_disk(self):
+        path = self._storage_path()
+        if not path:
+            return
+        serializable = [{"id": s["id"], "title": s["title"], "url": s["url"]} for s in self.sites]
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(serializable, fh, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(f"[ShortcutPill] write storage error: {e}")
+
+    def _current_site(self) -> Dict[str, str]:
+        for site in self.sites:
+            if site["id"] == self.current_site_id:
+                return site
+        self.current_site_id = self.sites[0]["id"]
+        return self.sites[0]
+
+    def _shift_site(self, delta: int):
+        if not self.sites:
+            return
+        current_index = 0
+        for index, site in enumerate(self.sites):
+            if site["id"] == self.current_site_id:
+                current_index = index
+                break
+        new_index = (current_index + delta) % len(self.sites)
+        self._set_current_site(self.sites[new_index]["id"])
+
+    def _set_current_site(self, site_id: str):
+        if site_id == self.current_site_id:
+            return
+        target = next((s for s in self.sites if s["id"] == site_id), None)
+        if not target:
+            return
+        self.current_site_id = site_id
+        self.set_setting("current_site_id", self.current_site_id)
+        self._ensure_favicon(target)
+        self.refresh_all_pills()
+
+    def on_plugin_load(self):
+        if self._loaded:
+            return
+        if not all([self.PillRegistry, self.PillInfo, self.PillCreator, self.PillStackConfig, self.WeatherPill]):
+            self.log("[ShortcutPill] Required classes missing")
+            return
+        if not self.get_setting("enabled", True):
+            return
+        self._loaded = True
+        self._register_pill()
+        self._ensure_favicon(self._current_site())
+
+    def on_plugin_unload(self):
+        self._loaded = False
+        for hook in list(self._hooks):
+            try:
+                if hook is not None:
+                    self.unhook_method(hook)
+            except Exception:
+                pass
+        self._hooks.clear()
+        self.active_pills.clear()
+        try:
+            if self.PillRegistry.isRegistered(PILL_ID):
+                self.PillRegistry.unregister(PILL_ID)
+                active = self._active_pills()
+                if active is not None:
+                    for i in range(active.size() - 1, -1, -1):
+                        if int(active.get(i)) == PILL_ID:
+                            active.remove(i)
+                self.PillStackConfig.savePillsLayout()
+        except Exception as e:
+            self.log(f"[ShortcutPill] unregister error: {e}")
+
+    def _active_pills(self):
+        try:
+            return self.PillStackConfig.getActivePills()
+        except Exception:
+            return None
+
+    def _register_pill(self):
+        plugin = self
+
+        class Creator(dynamic_proxy(self.PillCreator)):
+            def __init__(self):
+                super().__init__()
+
+            def create(self, context, resources_provider):
+                try:
+                    pill = plugin.WeatherPill(context, resources_provider)
+                    pill.setTag(AI_PILL_TAG_KEY, jint(PILL_ID))
+                    plugin.active_pills.add(pill)
+                    plugin._attach_touch_listener(pill)
+                    plugin.update_ui(pill)
+                    return pill
+                except Exception as e:
+                    plugin.log(f"[ShortcutPill] create error: {e}\n{traceback.format_exc()}")
+                    return None
+
+        try:
+            if self.PillRegistry.isRegistered(PILL_ID):
+                self.PillRegistry.unregister(PILL_ID)
+            ctx = self.ApplicationLoader.applicationContext
+            res = ctx.getResources()
+            icon_id = res.getIdentifier("msg_language", "drawable", ctx.getPackageName())
+            pill_info = self.PillInfo(jint(PILL_ID), "Web Links", jint(icon_id or R.drawable.msg_language), jint(-11565578), jint(-13276952), Creator())
+            self.PillRegistry.register(pill_info)
+        except Exception as e:
+            self.log(f"[ShortcutPill] registry error: {e}\n{traceback.format_exc()}")
+            return
+
+        class PillIdHook(MethodHook):
+            def before_hooked_method(self, param):
+                tag = param.thisObject.getTag(AI_PILL_TAG_KEY)
+                if tag and int(tag) == PILL_ID:
+                    plugin.active_pills.add(param.thisObject)
+                    param.setResult(jint(PILL_ID))
+
+        class InteractionHook(MethodHook):
+            def before_hooked_method(self, param):
+                tag = param.thisObject.getTag(AI_PILL_TAG_KEY)
+                if not tag or int(tag) != PILL_ID:
+                    return
+                plugin.active_pills.add(param.thisObject)
+                name = param.method.getName()
+                if name == "onPillClicked":
+                    plugin._open_site()
+                    param.setResult(None)
+                elif name == "onPillLongClicked":
+                    plugin._show_quick_settings_sheet()
+                    param.setResult(True)
+                elif name in ("onUpdateData", "setData"):
+                    param.setResult(None)
+
+        for method_name, hook_cls in (
+            ("getPillId", PillIdHook),
+            ("onPillClicked", InteractionHook),
+            ("onPillLongClicked", InteractionHook),
+            ("onUpdateData", InteractionHook),
+            ("setData", InteractionHook),
+        ):
+            try:
+                lst = self.hook_all_methods(self.WeatherPill, method_name, hook_cls())
+                if lst:
+                    self._hooks.extend([h for h in lst if h is not None])
+            except Exception as e:
+                self.log(f"[ShortcutPill] hook {method_name} error: {e}")
+        self._ensure_pill_enabled()
+
+    def _ensure_pill_enabled(self):
+        try:
+            active = self._active_pills()
+            if active is None:
+                return
+            is_active = False
+            for i in range(active.size()):
+                if int(active.get(i)) == PILL_ID:
+                    is_active = True
+                    break
+            if not is_active:
+                active.add(jint(PILL_ID))
+            try:
+                hidden = self.PillStackConfig.getHiddenPills()
+            except Exception:
+                hidden = None
+            if hidden is not None:
+                for i in range(hidden.size() - 1, -1, -1):
+                    if int(hidden.get(i)) == PILL_ID:
+                        hidden.remove(i)
+            self.PillStackConfig.savePillsLayout()
+        except Exception as e:
+            self.log(f"[ShortcutPill] PillStack sync error: {e}")
+
+    def _attach_touch_listener(self, pill):
+        try:
+            if pill.getTag(TOUCH_TAG_KEY):
+                return
+        except Exception:
+            pass
+
+        plugin = self
+
+        class TouchListener(dynamic_proxy(View.OnTouchListener)):
+            def __init__(self):
+                super().__init__()
+                self.down_x = 0.0
+                self.down_y = 0.0
+                self.down_at = 0.0
+                self.swiped = False
+                self.locked = False
+                self.pending_delta = 0
+
+            def onTouch(self, view, event):
+                try:
+                    action = int(event.getAction())
+                    if action == MotionEvent.ACTION_DOWN:
+                        self.down_x = float(event.getRawX())
+                        self.down_y = float(event.getRawY())
+                        self.down_at = time.time()
+                        self.swiped = False
+                        self.locked = False
+                        self.pending_delta = 0
+                        return True
+                    if action == MotionEvent.ACTION_MOVE:
+                        dx = float(event.getRawX()) - self.down_x
+                        dy = float(event.getRawY()) - self.down_y
+                        if not self.swiped and abs(dx) > AndroidUtilities.dp(18.0) and abs(dx) > abs(dy) + AndroidUtilities.dp(6.0):
+                            if not self.locked:
+                                plugin._request_disallow_intercept(view, True)
+                                self.locked = True
+                            self.swiped = True
+                            self.pending_delta = -1 if dx > 0 else 1
+                        return True
+                    if action == MotionEvent.ACTION_UP:
+                        if self.locked:
+                            plugin._request_disallow_intercept(view, False)
+                        if self.pending_delta:
+                            plugin._shift_site(self.pending_delta)
+                            self.pending_delta = 0
+                            return True
+                        dx = abs(float(event.getRawX()) - self.down_x)
+                        dy = abs(float(event.getRawY()) - self.down_y)
+                        press_ms = (time.time() - self.down_at) * 1000.0
+                        if dx <= AndroidUtilities.dp(10.0) and dy <= AndroidUtilities.dp(10.0):
+                            if press_ms >= 420.0:
+                                plugin._show_quick_settings_sheet()
+                            else:
+                                plugin._open_site()
+                        return True
+                    if action == MotionEvent.ACTION_CANCEL:
+                        if self.locked:
+                            plugin._request_disallow_intercept(view, False)
+                        self.pending_delta = 0
+                        return True
+                except Exception as e:
+                    plugin.log(f"[ShortcutPill] touch error: {e}")
+                    return False
+                return False
+
+        try:
+            pill.setOnTouchListener(TouchListener())
+            pill.setTag(TOUCH_TAG_KEY, jint(1))
+        except Exception as e:
+            self.log(f"[ShortcutPill] attach touch error: {e}")
+
+    def _request_disallow_intercept(self, view: Any, disallow: bool):
+        try:
+            parent = view.getParent()
+            while parent is not None:
+                if hasattr(parent, "requestDisallowInterceptTouchEvent"):
+                    parent.requestDisallowInterceptTouchEvent(bool(disallow))
+                parent = parent.getParent() if hasattr(parent, "getParent") else None
+        except Exception:
+            pass
+
+    def refresh_all_pills(self):
+        run_on_ui_thread(lambda: [self.update_ui(pill) for pill in list(self.active_pills)])
+
+    def _subtitle_view(self, pill, layout):
+        view = None
+        try:
+            view = pill.getTag(SUBTITLE_TAG_KEY)
+        except Exception:
+            view = None
+        if view is not None:
+            return view
+        view = TextView(pill.getContext())
+        view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11)
+        view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        layout.addView(view, LayoutHelper.createLinear(-2, -2, 0, 0, 0, 0, 0))
+        try:
+            pill.setTag(SUBTITLE_TAG_KEY, view)
+        except Exception:
+            pass
+        return view
+
+    def update_ui(self, pill):
+        if not pill or pill not in self.active_pills:
+            return
+        site = self._current_site()
+        try:
+            layout = get_private_field(pill, "layout")
+            title_view = get_private_field(pill, "textView")
+            icon_view = get_private_field(pill, "iconView")
+
+            if layout:
+                pad = AndroidUtilities.dp(10.0)
+                layout.setPadding(pad, 0, pad, 0)
+
+            if title_view:
+                if self.show_title:
+                    title_view.setVisibility(View.VISIBLE)
+                    title_view.setText(site["title"])
+                    title_view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                else:
+                    title_view.setVisibility(View.GONE)
+
+            if layout:
+                subtitle_view = self._subtitle_view(pill, layout)
+                subtitle_text = urlparse(site["url"]).hostname or site["url"]
+                if self.show_subtitle:
+                    subtitle_view.setVisibility(View.VISIBLE)
+                    subtitle_view.setText(subtitle_text)
+                    subtitle_view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+                else:
+                    subtitle_view.setVisibility(View.GONE)
+
+            if icon_view:
+                if self.show_icon:
+                    bitmap = self._get_favicon(site)
+                    if bitmap is None:
+                        icon_view.setVisibility(View.INVISIBLE)
+                        self._ensure_favicon(site)
+                    else:
+                        icon_view.setImageBitmap(bitmap)
+                        icon_view.setVisibility(View.VISIBLE)
+                else:
+                    icon_view.setVisibility(View.GONE)
+        except Exception as e:
+            self.log(f"[ShortcutPill] update_ui error: {e}\n{traceback.format_exc()}")
+
+    def _get_favicon(self, site: Dict[str, str]):
+        with self._favicon_lock:
+            bmp = self._favicon_cache.get(site["id"])
+            if bmp is not None:
+                return bmp
+        return None
+
+    def _ensure_favicon(self, site: Dict[str, str]):
+        site_id = site["id"]
+        with self._favicon_lock:
+            if site_id in self._favicon_cache:
+                return
+            if site_id in self._favicon_fetching:
+                return
+            self._favicon_fetching.add(site_id)
+        run_on_queue(lambda: self._fetch_favicon(site))
+
+    def _fetch_favicon(self, site: Dict[str, str]):
+        site_id = site["id"]
+        host = urlparse(site["url"]).hostname
+        if not host:
+            return
+        bitmap = None
+        try:
+            req = urllib.request.Request(
+                FAVICON_ENDPOINT.format(host=host),
+                headers={"User-Agent": "Mozilla/5.0 (Android) WebShortcutPill"},
+            )
+            data = urllib.request.urlopen(req, timeout=10).read()
+            bitmap = BitmapFactory.decodeByteArray(data, 0, len(data))
+            if bitmap is None:
+                raise ValueError("Decode failed")
+        except Exception as e:
+            self.log(f"[ShortcutPill] favicon error: {e}")
+            bitmap = self._placeholder_icon(site)
+        with self._favicon_lock:
+            self._favicon_cache[site_id] = bitmap
+            self._favicon_fetching.discard(site_id)
+            if len(self._favicon_cache) > 24:
+                keep = set(s["id"] for s in self.sites[:24])
+                for old_id in list(self._favicon_cache.keys()):
+                    if old_id not in keep and old_id != site_id:
+                        self._favicon_cache.pop(old_id, None)
+        self.refresh_all_pills()
+
+    def _placeholder_icon(self, site: Dict[str, str]):
+        host = urlparse(site["url"]).hostname or site["title"]
+        initials = "".join(part[:1].upper() for part in host.split(".") if part)
+        initials = initials[:2] or "WEB"
+        size = max(38, AndroidUtilities.dp(34))
+        bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        canvas = Canvas(bitmap)
+        paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.setColor(Theme.getColor(Theme.key_switchTrackChecked))
+        radius = float(size) / 2.0
+        canvas.drawCircle(radius, radius, radius, paint)
+        text = Paint(Paint.ANTI_ALIAS_FLAG)
+        text.setColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+        text.setTextSize(float(AndroidUtilities.dp(12)))
+        text.setTextAlign(Paint.Align.CENTER)
+        try:
+            text.setTypeface(AndroidUtilities.bold())
+        except Exception:
+            pass
+        fm = text.getFontMetrics()
+        baseline = radius - ((fm.ascent + fm.descent) / 2.0)
+        canvas.drawText(initials, radius, baseline, text)
+        return bitmap
+
+    def _open_site(self):
+        site = self._current_site()
+        url = site.get("url")
+        if not url:
+            run_on_queue(lambda: BulletinHelper.show_error("Ссылка не задана"))
+            return
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else self.ApplicationLoader.applicationContext
+            Browser.openUrl(activity, url, True)
+        except Exception as e:
+            self.log(f"[ShortcutPill] open url error: {e}")
+            run_on_queue(lambda: BulletinHelper.show_error("Не удалось открыть ссылку"))
+
+    def _open_plugin_settings(self):
+        try:
+            if not self.PluginsController or not self.PluginSettingsActivity:
+                return
+            controller = self.PluginsController.getInstance()
+            plugins_map = getattr(controller, "plugins", None)
+            if plugins_map is None:
+                try:
+                    plugins_map = controller.getPlugins()
+                except Exception:
+                    plugins_map = None
+            java_plugin = plugins_map.get(self.id) if plugins_map else None
+            if java_plugin:
+                fragment = get_last_fragment()
+                if fragment:
+                    fragment.presentFragment(self.PluginSettingsActivity(java_plugin))
+        except Exception as e:
+            self.log(f"[ShortcutPill] plugin settings error: {e}")
+
+    def _show_quick_settings_sheet(self, activity=None):
+        if activity is None:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+        if activity is None and self._last_activity is not None:
+            activity = self._last_activity
+        if activity is None:
+            return
+        self._last_activity = activity
+
+        sheet = BottomSheet(activity, True)
+        root = ScrollView(activity)
+        container = LinearLayout(activity)
+        container.setOrientation(LinearLayout.VERTICAL)
+        container.setPadding(AndroidUtilities.dp(20), AndroidUtilities.dp(18), AndroidUtilities.dp(20), AndroidUtilities.dp(22))
+        root.addView(container, LayoutHelper.createScroll(-1, -2, Gravity.TOP | Gravity.LEFT))
+
+        title = TextView(activity)
+        title.setText("Web Shortcut")
+        title.setTypeface(AndroidUtilities.bold())
+        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20)
+        title.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        container.addView(title, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 6))
+
+        hint = TextView(activity)
+        hint.setText("Свайпай — листай сайты, тап — открывай, длинный тап — это меню")
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        hint.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+        container.addView(hint, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 14))
+
+        sites_wrap = LinearLayout(activity)
+        sites_wrap.setOrientation(LinearLayout.VERTICAL)
+        container.addView(sites_wrap, LayoutHelper.createLinear(-1, -2))
+
+        def rebuild_sites():
+            sites_wrap.removeAllViews()
+            for index, site in enumerate(self.sites):
+                card = LinearLayout(activity)
+                card.setOrientation(LinearLayout.VERTICAL)
+                card.setPadding(AndroidUtilities.dp(14), AndroidUtilities.dp(12), AndroidUtilities.dp(14), AndroidUtilities.dp(12))
+                bg = GradientDrawable()
+                bg.setCornerRadius(float(AndroidUtilities.dp(16)))
+                bg.setColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+                bg.setStroke(AndroidUtilities.dp(1), Theme.getColor(Theme.key_divider))
+                card.setBackground(bg)
+
+                header = LinearLayout(activity)
+                header.setOrientation(LinearLayout.HORIZONTAL)
+                header.setGravity(Gravity.CENTER_VERTICAL)
+
+                title_view = TextView(activity)
+                title_view.setText(f"{index + 1}. {site['title']}")
+                title_view.setTypeface(AndroidUtilities.bold())
+                title_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16)
+                title_view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+                header.addView(title_view, LinearLayout.LayoutParams(0, -2, 1.0))
+
+                if site['id'] == self.current_site_id:
+                    badge = TextView(activity)
+                    badge.setText("Текущий")
+                    badge.setTypeface(AndroidUtilities.bold())
+                    badge.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+                    badge.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+                    badge.setPadding(AndroidUtilities.dp(10), AndroidUtilities.dp(4), AndroidUtilities.dp(10), AndroidUtilities.dp(4))
+                    badge_bg = GradientDrawable()
+                    badge_bg.setCornerRadius(float(AndroidUtilities.dp(12)))
+                    badge_bg.setColor(Theme.getColor(Theme.key_switchTrackChecked))
+                    badge.setBackground(badge_bg)
+                    header.addView(badge)
+                else:
+                    header.addView(
+                        self._sheet_button(activity, "Сделать активным", lambda _v, sid=site['id']: (self._set_current_site(sid), rebuild_sites())),
+                        LayoutHelper.createLinear(-2, -2),
+                    )
+
+                card.addView(header)
+
+                subtitle = TextView(activity)
+                subtitle.setText(site['url'])
+                subtitle.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+                subtitle.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
+                subtitle_params = LayoutHelper.createLinear(-1, -2, 0, 6, 0, 0, 6)
+                card.addView(subtitle, subtitle_params)
+
+                row_top = LinearLayout(activity)
+                row_top.setOrientation(LinearLayout.HORIZONTAL)
+                row_top.setPadding(0, AndroidUtilities.dp(4), 0, 0)
+                row_top.addView(self._sheet_button(activity, "Вверх", lambda _v, sid=site['id']: (self._move_site(sid, -1), rebuild_sites())), LayoutHelper.createLinear(0, -2, 1.0))
+                row_top.addView(self._sheet_button(activity, "Вниз", lambda _v, sid=site['id']: (self._move_site(sid, 1), rebuild_sites())), LayoutHelper.createLinear(0, -2, 1.0, 8, 0, 0, 0))
+                card.addView(row_top, LayoutHelper.createLinear(-1, -2))
+
+                row_bottom = LinearLayout(activity)
+                row_bottom.setOrientation(LinearLayout.HORIZONTAL)
+                row_bottom.setPadding(0, AndroidUtilities.dp(6), 0, 0)
+                row_bottom.addView(self._sheet_button(activity, "Редактировать", lambda _v, s=site: self._show_edit_site_sheet(existing=s, on_saved=rebuild_sites)), LayoutHelper.createLinear(0, -2, 1.0))
+                row_bottom.addView(self._sheet_button(activity, "Удалить", lambda _v, sid=site['id']: (self._delete_site(sid), rebuild_sites())), LayoutHelper.createLinear(0, -2, 1.0, 8, 0, 0, 0))
+                card.addView(row_bottom, LayoutHelper.createLinear(-1, -2))
+
+                sites_wrap.addView(card, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 12))
+
+        rebuild_sites()
+
+        add_btn = self._sheet_button(activity, "Добавить сайт", lambda _v: self._show_edit_site_sheet(on_saved=rebuild_sites))
+        container.addView(add_btn, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 18))
+
+        def shift_and_refresh(delta):
+            self._shift_site(delta)
+            rebuild_sites()
+
+        actions = LinearLayout(activity)
+        actions.setOrientation(LinearLayout.HORIZONTAL)
+        actions.addView(self._sheet_button(activity, "Следующий", lambda _v: shift_and_refresh(1)), LayoutHelper.createLinear(0, -2, 1.0))
+        actions.addView(self._sheet_button(activity, "Предыдущий", lambda _v: shift_and_refresh(-1)), LayoutHelper.createLinear(0, -2, 1.0, 8, 0, 0, 0))
+        container.addView(actions, LayoutHelper.createLinear(-1, -2, 0, 10, 0, 0, 10))
+
+        settings_btn = self._sheet_button(activity, "Полные настройки", lambda _v: self._open_plugin_settings())
+        container.addView(settings_btn, LayoutHelper.createLinear(-1, -2))
+
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def _open_sites_manager(self, source_view=None):
+        activity = self._activity_from_view(source_view)
+        self._show_quick_settings_sheet(activity=activity)
+
+    def _activity_from_view(self, view):
+        context = None
+        try:
+            if view is not None and hasattr(view, "getContext"):
+                context = view.getContext()
+        except Exception:
+            context = None
+        depth = 0
+        while context is not None and depth < 6:
+            name = str(context.__class__.__name__)
+            if name.endswith("Activity"):
+                return context
+            if hasattr(context, "getBaseContext"):
+                context = context.getBaseContext()
+            elif hasattr(context, "getContext"):
+                context = context.getContext()
+            else:
+                break
+            depth += 1
+        return None
+
+    def _manager_button(self, activity, text, on_click):
+        btn = TextView(activity)
+        btn.setText(text)
+        btn.setPadding(AndroidUtilities.dp(12), AndroidUtilities.dp(8), AndroidUtilities.dp(12), AndroidUtilities.dp(8))
+        btn.setTypeface(AndroidUtilities.bold())
+        primary = Theme.getColor(Theme.key_switchTrackChecked)
+        secondary = Theme.getColor(Theme.key_switchTrack)
+        btn.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+        drawable = Theme.createSimpleSelectorRoundRectDrawable(AndroidUtilities.dp(14), primary, secondary)
+        btn.setBackground(drawable)
+        btn.setClickable(True)
+        btn.setFocusable(True)
+        btn.setOnClickListener(self._make_click_listener(on_click))
+        return btn
+
+    def _sheet_button(self, ctx, text, on_click):
+        button = TextView(ctx)
+        button.setText(text)
+        button.setGravity(Gravity.CENTER)
+        button.setTypeface(AndroidUtilities.bold())
+        button.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        button.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        button.setPadding(AndroidUtilities.dp(10), AndroidUtilities.dp(8), AndroidUtilities.dp(10), AndroidUtilities.dp(8))
+        bg = GradientDrawable()
+        bg.setCornerRadius(float(AndroidUtilities.dp(12)))
+        bg.setColor(Theme.getColor(Theme.key_windowBackgroundWhite))
+        bg.setStroke(AndroidUtilities.dp(1), Theme.getColor(Theme.key_divider))
+        button.setBackground(bg)
+        button.setClickable(True)
+        button.setFocusable(True)
+        button.setOnClickListener(self._make_click_listener(on_click))
+        return button
+
+    def _make_click_listener(self, fn):
+        plugin = self
+
+        class _Listener(dynamic_proxy(View.OnClickListener)):
+            def __init__(self):
+                super().__init__()
+
+            def onClick(self, view):
+                try:
+                    fn(view)
+                except Exception as e:
+                    plugin.log(f"[ShortcutPill] click error: {e}")
+
+        return _Listener()
+
+    def _move_site(self, site_id: str, delta: int):
+        index = next((i for i, s in enumerate(self.sites) if s["id"] == site_id), -1)
+        if index == -1:
+            return
+        target = max(0, min(len(self.sites) - 1, index + delta))
+        if target == index:
+            return
+        self.sites.insert(target, self.sites.pop(index))
+        self._save_sites()
+        self.refresh_all_pills()
+
+    def _delete_site(self, site_id: str):
+        if len(self.sites) <= 1:
+            BulletinHelper.show_error("Хотя бы один сайт должен остаться")
+            return
+        self.sites = [s for s in self.sites if s["id"] != site_id]
+        if self.current_site_id == site_id:
+            self.current_site_id = self.sites[0]["id"]
+            self.set_setting("current_site_id", self.current_site_id)
+        self._save_sites()
+        self.refresh_all_pills()
+
+    def _show_edit_site_sheet(self, existing: Dict[str, str] = None, on_saved=None):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            return
+        sheet = BottomSheet(activity, True)
+        root = LinearLayout(activity)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(16), AndroidUtilities.dp(20))
+
+        title_view = TextView(activity)
+        title_view.setText("Редактировать сайт" if existing else "Новый сайт")
+        title_view.setTypeface(AndroidUtilities.bold())
+        title_view.setTextSize(18)
+        title_view.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        root.addView(title_view, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 12))
+
+        name_input = EditText(activity)
+        name_input.setHint("Название")
+        name_input.setText(existing.get("title") if existing else "")
+        name_input.setSingleLine(True)
+        root.addView(name_input, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 12))
+
+        url_input = EditText(activity)
+        url_input.setHint("https://...")
+        url_input.setInputType(0x00002001)
+        url_input.setText(existing.get("url") if existing else "")
+        url_input.setSingleLine(True)
+        root.addView(url_input, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 0, 20))
+
+        def save():
+            title = name_input.getText().toString().strip()
+            url = url_input.getText().toString().strip()
+            if not url:
+                BulletinHelper.show_error("Нужна ссылка")
+                return
+            if not url.lower().startswith(("http://", "https://")):
+                url = f"https://{url}"
+            if existing:
+                existing["title"] = title or urlparse(url).hostname or "Website"
+                existing["url"] = url
+                target_site = existing
+            else:
+                target_site = {"id": uuid.uuid4().hex, "title": title or urlparse(url).hostname or "Website", "url": url}
+                self.sites.append(target_site)
+            self._save_sites()
+            sheet.dismiss()
+            self.refresh_all_pills()
+            self._ensure_favicon(target_site)
+            if on_saved:
+                run_on_ui_thread(on_saved)
+
+        save_btn = self._manager_button(activity, "Сохранить", lambda _v: save())
+        root.addView(save_btn)
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def create_settings(self):
+        return [
+            Header("Web Shortcut"),
+            Switch(key="enabled", text="Включить", default=True, on_change=lambda value: self._toggle_enabled(value)),
+            Text(text="Управление сайтами", icon="msg_reorder", on_click=lambda view: self._open_sites_manager(view)),
+            Switch(key="show_icon", text="Показывать иконку", default=self.show_icon, on_change=lambda value: self._set_flag("show_icon", value)),
+            Switch(key="show_title", text="Показывать название", default=self.show_title, on_change=lambda value: self._set_flag("show_title", value)),
+            Switch(key="show_subtitle", text="Показывать домен", default=self.show_subtitle, on_change=lambda value: self._set_flag("show_subtitle", value)),
+            Text(text="Открыть текущий сайт", icon="msg_language", on_click=lambda _v: self._open_site()),
+            Text(text="Обновить иконку", icon="msg_refresh", on_click=lambda _v: self._force_refresh_icon()),
+        ]
+
+    def _toggle_enabled(self, value):
+        self.set_setting("enabled", bool(value))
+        if value:
+            self.on_plugin_load()
+        else:
+            self.on_plugin_unload()
+
+    def _set_flag(self, key: str, value: bool):
+        self.set_setting(key, bool(value))
+        setattr(self, key, bool(value))
+        self.refresh_all_pills()
+
+    def _force_refresh_icon(self):
+        site = self._current_site()
+        with self._favicon_lock:
+            self._favicon_cache.pop(site["id"], None)
+            self._favicon_fetching.discard(site["id"])
+        self._ensure_favicon(site)

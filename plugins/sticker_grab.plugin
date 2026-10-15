@@ -1,0 +1,219 @@
+__id__ = "sticker_grab"
+__name__ = "Sticker Grab"
+__description__ = "Лонг-тап по чужому стикеру → «В мой пак»: добавляет стикер в твой стикер-пак (shortname указывается в настройках)."
+__author__ = "@progrressiya | @Kanyon_e"
+__version__ = "1.0.0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.6"
+
+import traceback
+
+from java import jclass
+from java.util import jarray
+from java.lang import Integer, Object
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from android_utils import R, run_on_ui_thread
+from client_utils import RequestCallback, get_connections_manager, get_media_data_controller
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Text
+
+_plugin = None
+
+ItemOptionsClass = find_class("org.telegram.ui.Components.ItemOptions")
+MediaDataController = jclass("org.telegram.messenger.MediaDataController")
+R_drawable = find_class("org.telegram.messenger.R$drawable")
+ChatMessageCellClass = find_class("org.telegram.ui.Cells.ChatMessageCell")
+
+TLRPC = find_class("org.telegram.tgnet.TLRPC")
+
+
+def _icon():
+    for name in ("msg_sticker", "msg_saved", "msg_add"):
+        try:
+            v = int(getattr(R_drawable, name, 0))
+            if v:
+                return v
+        except Exception:
+            pass
+    return 0
+
+
+def _sticker_emoji(doc):
+    try:
+        for a in doc.attributes:
+            alt = getattr(a, "alt", None)
+            if alt:
+                return str(alt)
+    except Exception:
+        pass
+    return "🙂"
+
+
+def _find_add_method(cls):
+    try:
+        for m in cls.getDeclaredMethods():
+            if m.getName() == "add":
+                pt = m.getParameterTypes()
+                if len(pt) == 3 and pt[0].getName() == "int" \
+                        and "CharSequence" in pt[1].getName() \
+                        and pt[2].getName() == "java.lang.Runnable":
+                    m.setAccessible(True)
+                    return m
+    except Exception:
+        pass
+    return None
+
+
+class _MenuHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            if _plugin is None:
+                return
+            opts = param.thisObject
+            if opts is None:
+                return
+            view = get_private_field(opts, "view")
+            if view is None:
+                return
+            try:
+                if not ChatMessageCellClass.isInstance(view):
+                    return
+            except Exception:
+                return
+            mo = view.getCurrentMessageObject()
+            if mo is None or not mo.isSticker():
+                return
+            if not mo.isAnimatedSticker() and not mo.isSticker():
+                return
+            add = _find_add_method(opts.getClass())
+            if add is None:
+                return
+            plugin = _plugin
+            doc = mo.getDocument()
+            if doc is None:
+                return
+            runnable = R(lambda d=doc: plugin.add_to_pack(d))
+            plugin.keep(runnable)
+            args = jarray(Object)([Integer(_icon()), "В мой пак", runnable])
+            add.invoke(opts, args)
+        except Exception as e:
+            if _plugin:
+                _plugin.log("grab: menu: %s" % e)
+
+
+class StickerGrabPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self._keep = []
+        self._unhooks = []
+
+    def on_plugin_load(self):
+        global _plugin
+        _plugin = self
+        self._keep = []
+        self._unhooks = []
+        try:
+            cls = ItemOptionsClass.getClass()
+        except Exception:
+            cls = ItemOptionsClass
+        try:
+            for m in cls.getDeclaredMethods():
+                if m.getName() == "show" and len(m.getParameterTypes()) == 0:
+                    m.setAccessible(True)
+                    self._unhooks.append(self.hook_method(m, _MenuHook(self)))
+        except Exception as e:
+            self.log("grab: hook error: %s" % e)
+        self.log("grab: loaded (%d hooks)" % len(self._unhooks))
+
+    def on_plugin_unload(self):
+        global _plugin
+        _plugin = None
+        for h in getattr(self, "_unhooks", []):
+            try:
+                self.unhook_method(h)
+            except Exception:
+                pass
+        self._unhooks = []
+        self._keep = []
+
+    def keep(self, obj):
+        self._keep.append(obj)
+
+    def add_to_pack(self, doc):
+        try:
+            shortname = str(self.get_setting("pack", "") or "").strip()
+            if not shortname:
+                run_on_ui_thread(R(lambda: BulletinHelper.show_error(
+                    "Укажи shortname пака в настройках")))
+                return
+            emoji = _sticker_emoji(doc)
+
+            def with_set(sticker_set):
+                try:
+                    req = TLRPC.TL_stickers_addStickerToSet()
+                    req.stickerset = MediaDataController.getInputStickerSet(sticker_set)
+                    req.sticker = MediaDataController.getInputStickerSetItem(doc, emoji)
+                    cm = get_connections_manager()
+
+                    def on_resp(response, error):
+                        if error is not None:
+                            msg = "Ошибка: %s" % getattr(error, "text", "unknown")
+                            run_on_ui_thread(R(lambda m=msg: BulletinHelper.show_error(m)))
+                            return
+                        run_on_ui_thread(R(lambda: BulletinHelper.show_success(
+                            "Стикер добавлен в %s" % shortname)))
+
+                    cm.sendRequest(req, RequestCallback(on_resp))
+                except Exception as e:
+                    self.log("grab: add: %s\n%s" % (e, traceback.format_exc()))
+                    run_on_ui_thread(R(lambda: BulletinHelper.show_error("Ошибка добавления")))
+
+            mdc = get_media_data_controller()
+            cached = None
+            try:
+                cached = mdc.getStickerSetByName(shortname)
+            except Exception:
+                cached = None
+            if cached is not None:
+                with_set(cached)
+                return
+            req = TLRPC.TL_messages_getStickerSet()
+            req.stickerset = TLRPC.TL_inputStickerSetShortName()
+            req.stickerset.shortname = shortname
+            cm = get_connections_manager()
+
+            def on_set_resp(response, error):
+                if error is not None or response is None:
+                    run_on_ui_thread(R(lambda: BulletinHelper.show_error(
+                        "Пак %s не найден" % shortname)))
+                    return
+                sticker_set = getattr(response, "set", None)
+                if sticker_set is None:
+                    run_on_ui_thread(R(lambda: BulletinHelper.show_error(
+                        "Пак %s не найден" % shortname)))
+                    return
+                run_on_ui_thread(R(lambda s=sticker_set: with_set(s)))
+
+            cm.sendRequest(req, RequestCallback(on_set_resp))
+        except Exception as e:
+            self.log("grab: %s\n%s" % (e, traceback.format_exc()))
+
+    def create_settings(self):
+        return [
+            Header(text="Sticker Grab"),
+            Input(
+                key="pack",
+                text="Shortname твоего пака",
+                default="",
+                subtext="Как в t.me/addstickers/ИМЯ. Пак должен быть твоим (создан через @Stickers)",
+                icon="msg_sticker",
+            ),
+            Text(
+                text="Как работает",
+                subtext="Зажми любой стикер в чате → «В мой пак»",
+                icon="msg_info",
+            ),
+        ]

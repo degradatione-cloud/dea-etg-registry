@@ -1,0 +1,184 @@
+__id__ = "anti_delete"
+__name__ = "Anti-Delete"
+__description__ = "Показывает удалённые и отредактированные сообщения в открытом чате: буллетин с текстом «до»."
+__author__ = "@progrressiya | @Kanyon_e"
+__version__ = "1.0.0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.6"
+
+import traceback
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from android_utils import run_on_ui_thread, R
+from client_utils import get_last_fragment
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Text
+
+_plugin = None
+
+NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
+MessageObjectClass = find_class("org.telegram.messenger.MessageObject")
+ChatMessageCellClass = find_class("org.telegram.ui.Cells.ChatMessageCell")
+
+
+def _short(s, n=120):
+    try:
+        s = str(s).replace("\n", " ").strip()
+    except Exception:
+        s = ""
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def _show(text):
+    try:
+        run_on_ui_thread(R(lambda: BulletinHelper.show_info(text)))
+    except Exception:
+        pass
+
+
+class _DeletedHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            if _plugin is None or not _plugin.get_setting("show_deleted", True):
+                return
+            args = param.args
+            if len(args) < 2:
+                return
+            if int(args[0]) != int(getattr(NotificationCenter, "messagesDeleted")):
+                return
+            payload = args[1]
+            if payload is None or len(payload) < 2:
+                return
+            ids = payload[0]
+            dialog = payload[1]
+            try:
+                dialog = int(dialog)
+            except Exception:
+                return
+            frag = get_last_fragment()
+            if frag is None:
+                return
+            try:
+                frag_dialog = int(get_private_field(frag, "dialog_id"))
+            except Exception:
+                return
+            if frag_dialog != dialog:
+                return
+            md = get_private_field(frag, "messagesDict")
+            if md is None:
+                return
+            show_own = _plugin.get_setting("show_own", False)
+            texts = []
+            for i in range(len(ids)):
+                try:
+                    mid = int(ids[i])
+                    mo = md.get(mid)
+                except Exception:
+                    continue
+                if mo is None:
+                    continue
+                if not show_own and mo.isOutOwner():
+                    continue
+                t = str(getattr(mo, "messageText", "") or "")
+                if not t.strip():
+                    t = "[медиа]"
+                texts.append(_short(t))
+            if not texts:
+                return
+            if len(texts) == 1:
+                _show("🗑 Удалено: «%s»" % texts[0])
+            else:
+                _show("🗑 Удалено %d: %s" % (len(texts), " | ".join(texts)))
+        except Exception as e:
+            if _plugin:
+                _plugin.log("antidel: %s" % e)
+
+
+class _EditedHook(MethodHook):
+    def before_hooked_method(self, param):
+        try:
+            if _plugin is None or not _plugin.get_setting("show_edited", True):
+                return
+            obj = param.thisObject
+            if len(param.args) != 0:
+                return
+            old = str(getattr(obj, "messageText", "") or "")
+            owner = getattr(obj, "messageOwner", None)
+            new = str(getattr(owner, "message", "") or "")
+            if not old.strip() or not new.strip() or new == old:
+                return
+            if old.startswith("[медиа") or new.startswith("[медиа"):
+                return
+            _show("✏️ Отредактировано: было «%s»" % _short(old))
+        except Exception:
+            pass
+
+
+class AntiDeletePlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        global _plugin
+        _plugin = self
+        self._unhooks = []
+        try:
+            nc_cls = NotificationCenter.getClass()
+        except Exception:
+            nc_cls = NotificationCenter
+        try:
+            for m in nc_cls.getDeclaredMethods():
+                if m.getName() == "postNotificationName" and len(m.getParameterTypes()) == 2:
+                    m.setAccessible(True)
+                    self._unhooks.append(self.hook_method(m, _DeletedHook()))
+        except Exception as e:
+            self.log("antidel: notif hook error: %s" % e)
+        try:
+            mo_cls = MessageObjectClass.getClass()
+        except Exception:
+            mo_cls = MessageObjectClass
+        try:
+            lst = self.hook_all_methods(mo_cls, "updateMessageText", _EditedHook())
+            if lst:
+                self._unhooks.extend(lst)
+        except Exception as e:
+            self.log("antidel: edit hook error: %s" % e)
+        self.log("antidel: loaded (%d hooks)" % len(self._unhooks))
+
+    def on_plugin_unload(self):
+        global _plugin
+        _plugin = None
+        for h in getattr(self, "_unhooks", []):
+            try:
+                self.unhook_method(h)
+            except Exception:
+                pass
+        self._unhooks = []
+
+    def create_settings(self):
+        return [
+            Header(text="Anti-Delete"),
+            Switch(
+                key="show_deleted",
+                text="Показывать удаления",
+                default=True,
+                icon="msg_delete",
+            ),
+            Switch(
+                key="show_edited",
+                text="Показывать редактирования",
+                default=True,
+                icon="msg_edit",
+            ),
+            Switch(
+                key="show_own",
+                text="Показывать свои удаления",
+                default=False,
+                subtext="Что ты сам удалил в открытом чате",
+                icon="msg_user",
+            ),
+            Text(
+                text="Как работает",
+                subtext="Буллетин с текстом до удаления/правки. Только для открытого чата",
+                icon="msg_info",
+            ),
+        ]

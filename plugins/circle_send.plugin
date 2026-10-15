@@ -1,0 +1,443 @@
+__id__ = "circle_send"
+__name__ = "Circle Send"
+__description__ = "Отправляет любое видео из галереи кружком (видеосообщением). Долгое нажатие на «Отправить» в просмотре видео → «Кружок»."
+__author__ = "@progrressiya | @Kanyon_e"
+__version__ = "1.0.1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.6"
+
+import traceback
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field, set_private_field
+from android_utils import R, run_on_ui_thread, log, OnLongClickListener
+from ui.settings import Header, Switch, Text
+from java import jclass, jarray
+
+
+PhotoViewerClass = find_class("org.telegram.ui.PhotoViewer")
+ItemOptionsClass = find_class("org.telegram.ui.Components.ItemOptions")
+UserConfigClass = find_class("org.telegram.messenger.UserConfig")
+MessagesControllerClass = find_class("org.telegram.messenger.MessagesController")
+R_drawable = find_class("org.telegram.messenger.R$drawable")
+CropStateClass = find_class("org.telegram.messenger.MediaController$CropState")
+SendMessagesHelperClass = find_class("org.telegram.messenger.SendMessagesHelper")
+
+
+def _to_class(value):
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "getDeclaredMethod"):
+            return value
+    except Exception:
+        pass
+    try:
+        return value.getClass()
+    except Exception:
+        return None
+
+
+class _OpenPhotoHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            provider = None
+            provider_class_obj = _to_class(find_class("org.telegram.ui.PhotoViewer$PhotoViewerProvider"))
+            for arg in param.args:
+                if arg is not None and hasattr(arg, "getClass"):
+                    if provider_class_obj and provider_class_obj.isInstance(arg):
+                        provider = arg
+                        break
+            if provider:
+                provider_class = provider.getClass()
+                class_name = provider_class.getName()
+                if class_name not in self.plugin.hooked_providers:
+                    self.plugin.hooked_providers.add(class_name)
+                    try:
+                        method = provider_class.getMethod("allowSendingSubmenu")
+                        method.setAccessible(True)
+                        self.plugin.hooks.append(
+                            self.plugin.hook_method(method, _AllowSubmenuHook(self.plugin)))
+                    except Exception as e:
+                        log("circle: allowSendingSubmenu hook fail: %s" % e)
+        except Exception as e:
+            log("circle: OpenPhotoHook: %s" % e)
+
+    def after_hooked_method(self, param):
+        try:
+            def setup():
+                pv = PhotoViewerClass.getInstance()
+                if pv:
+                    btn = get_private_field(pv, "pickerViewSendButton")
+                    if btn:
+                        self.plugin.setup_send_button(btn)
+            run_on_ui_thread(R(setup))
+        except Exception as e:
+            log("circle: OpenPhotoHook after: %s" % e)
+
+
+class _AllowSubmenuHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            pv = PhotoViewerClass.getInstance()
+            if pv and get_private_field(pv, "isCurrentVideo"):
+                param.setResult(True)
+        except Exception:
+            pass
+
+
+class _VideoInfoHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if not self.plugin.pending_round:
+            return
+        self.plugin.pending_round = False
+        try:
+            pv = param.thisObject
+            info = param.getResult()
+            if not info:
+                info = find_class("org.telegram.messenger.VideoEditedInfo")()
+            set_private_field(info, "roundVideo", True)
+
+            account = get_private_field(pv, "currentAccount")
+            if account is None:
+                account = UserConfigClass.selectedAccount
+            size = 384
+            bitrate = 1000000
+            try:
+                mc = MessagesControllerClass.getInstance(account)
+                if mc:
+                    size = int(getattr(mc, "roundVideoSize", 384))
+                    bitrate = int(getattr(mc, "roundVideoBitrate", 1000)) * 1000
+            except Exception:
+                pass
+
+            w = get_private_field(pv, "originalWidth") or 0
+            h = get_private_field(pv, "originalHeight") or 0
+            if w > 0 and h > 0:
+                pw = 1.0 if w <= h else float(h) / float(w)
+                ph = 1.0 if h <= w else float(w) / float(h)
+                crop = CropStateClass()
+                crop.cropPx = 0.0
+                crop.cropPy = 0.0
+                crop.cropScale = 1.0
+                crop.cropRotate = 0.0
+                crop.cropPw = pw
+                crop.cropPh = ph
+                crop.transformWidth = size
+                crop.transformHeight = size
+                crop.transformRotation = 0
+                crop.mirrored = False
+                crop.freeform = False
+                crop.lockedAspectRatio = 1.0
+                crop.initied = True
+                set_private_field(info, "cropState", crop)
+                set_private_field(info, "rotationValue", get_private_field(pv, "rotationValue") or 0)
+
+            set_private_field(info, "resultWidth", size)
+            set_private_field(info, "resultHeight", size)
+            set_private_field(info, "bitrate", bitrate)
+            set_private_field(info, "muted", get_private_field(pv, "muteVideo") or False)
+            vol = get_private_field(pv, "videoVolume")
+            set_private_field(info, "volume", 1.0 if vol is None else vol)
+            set_private_field(info, "startTime", get_private_field(pv, "startTime") or 0)
+            set_private_field(info, "endTime", get_private_field(pv, "endTime") or -1)
+            set_private_field(info, "start", get_private_field(pv, "videoCutStart") or 0)
+            set_private_field(info, "end", get_private_field(pv, "videoCutEnd") or -1)
+            path = get_private_field(pv, "currentPathObject")
+            if path:
+                set_private_field(info, "originalPath", path)
+            param.setResult(info)
+            log("circle: VideoEditedInfo forged (size=%d)" % size)
+        except Exception as e:
+            log("circle: VideoInfoHook: %s\n%s" % (e, traceback.format_exc()))
+
+
+class _SendMediaHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            media = param.args[1]
+            if not media or media.isEmpty():
+                return
+            info = media.get(0)
+            if not info or not info.videoEditedInfo:
+                return
+            if not get_private_field(info.videoEditedInfo, "roundVideo"):
+                return
+
+            helper = _to_class(SendMessagesHelperClass)
+            target = None
+            for m in helper.getDeclaredMethods():
+                if m.getName() == "prepareSendingVideo" and len(m.getParameterTypes()) == 25:
+                    target = m
+                    break
+            if target is None:
+                for m in helper.getDeclaredMethods():
+                    if m.getName() == "prepareSendingVideo" and len(m.getParameterTypes()) >= 23:
+                        target = m
+                        break
+            if not target:
+                log("circle: prepareSendingVideo not found")
+                return
+            n = len(param.args)
+            poll_shift = 0
+            if n >= 24:
+                poll_shift = 1
+
+            def A(i):
+                return param.args[i + poll_shift] if poll_shift and i >= 10 else param.args[i]
+
+            ttl = info.ttl
+            if self.plugin.pending_hidden:
+                ttl = 0x7FFFFFFF
+                self.plugin.pending_hidden = False
+
+            sched = A(11)
+            repeat = A(12)
+            quick = A(16)
+            quick_id = A(17)
+            effect = A(18)
+            j3 = A(20)
+            mono = A(21)
+            msp = A(22)
+
+            args = [
+                param.args[0],
+                info.path,
+                info.videoEditedInfo,
+                info.coverPath,
+                info.coverPhoto,
+                param.args[2],
+                param.args[3],
+                param.args[4],
+                param.args[5],
+                param.args[6],
+                info.entities,
+                ttl,
+                param.args[9],
+                param.args[7],
+                sched,
+                repeat,
+                param.args[8],
+                info.hasMediaSpoilers,
+                info.caption,
+                quick,
+                quick_id,
+                effect,
+            ]
+            if len(target.getParameterTypes()) >= 25:
+                args.extend([j3, mono, msp])
+            if len(target.getParameterTypes()) >= 26:
+                args.append(A(19))
+
+            target.setAccessible(True)
+            target.invoke(None, self.plugin.wrap_args(target, args))
+            param.setResult(None)
+            log("circle: redirected to prepareSendingVideo (%d params, media %d args)"
+                % (len(target.getParameterTypes()), n))
+        except Exception as e:
+            log("circle: SendMediaHook: %s\n%s" % (e, traceback.format_exc()))
+
+
+class CircleSendPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self.pending_round = False
+        self.pending_hidden = False
+        self.hooks = []
+        self.hooked_providers = set()
+        self.hooked_buttons = set()
+        self.button_orig_listeners = {}
+
+    def on_plugin_load(self):
+        self.hooks = []
+        self.hooked_providers = set()
+        self.hooked_buttons = set()
+        self.button_orig_listeners = {}
+        try:
+            pv_class = _to_class(PhotoViewerClass)
+            for m in pv_class.getDeclaredMethods():
+                if m.getName() == "openPhoto" and len(m.getParameterTypes()) >= 10:
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, _OpenPhotoHook(self)))
+            m = pv_class.getDeclaredMethod("getCurrentVideoEditedInfo")
+            m.setAccessible(True)
+            self.hooks.append(self.hook_method(m, _VideoInfoHook(self)))
+
+            helper = _to_class(SendMessagesHelperClass)
+            for m in helper.getDeclaredMethods():
+                if m.getName() == "prepareSendingMedia" and len(m.getParameterTypes()) >= 15:
+                    m.setAccessible(True)
+                    self.hooks.append(self.hook_method(m, _SendMediaHook(self)))
+
+            pv = PhotoViewerClass.getInstance()
+            if pv:
+                btn = get_private_field(pv, "pickerViewSendButton")
+                if btn:
+                    self.setup_send_button(btn)
+            self.log("circle: loaded (%d hooks)" % len(self.hooks))
+        except Exception as e:
+            self.log("circle: load error: %s" % e)
+
+    def on_plugin_unload(self):
+        for h in self.hooks:
+            try:
+                self.unhook_method(h)
+            except Exception:
+                pass
+        self.hooks = []
+        self.hooked_providers = set()
+        for btn, orig in self.button_orig_listeners.items():
+            try:
+                btn.setOnLongClickListener(orig)
+            except Exception:
+                pass
+        self.button_orig_listeners = {}
+        self.hooked_buttons = set()
+
+    def setup_send_button(self, btn):
+        try:
+            key = hash(btn)
+            if key in self.hooked_buttons:
+                return
+            orig = None
+            li = get_private_field(btn, "mListenerInfo")
+            if li:
+                orig = get_private_field(li, "mOnLongClickListener")
+            plugin = self
+
+            def custom_long_click(view):
+                try:
+                    pv = PhotoViewerClass.getInstance()
+                    if pv and get_private_field(pv, "isCurrentVideo"):
+                        plugin.show_menu(view)
+                        return True
+                    if orig:
+                        return orig.onLongClick(view)
+                except Exception as e:
+                    log("circle: long click: %s" % e)
+                return False
+
+            btn.setOnLongClickListener(OnLongClickListener(custom_long_click))
+            self.hooked_buttons.add(key)
+            self.button_orig_listeners[btn] = orig
+        except Exception as e:
+            log("circle: setup_send_button: %s" % e)
+
+    def show_menu(self, view):
+        try:
+            pv = PhotoViewerClass.getInstance()
+            if not pv:
+                return
+            container = get_private_field(pv, "containerView")
+            if not container:
+                return
+            dtrp = find_class("org.telegram.ui.Stories.DarkThemeResourceProvider")()
+            options = ItemOptionsClass.makeOptions(container, dtrp, view)
+            video_res = int(getattr(R_drawable, "msg_video", 0))
+            options.add(video_res, "Кружок", R(lambda: self.pick_round(False)))
+            if self.get_setting("show_hidden", True):
+                secret_res = int(getattr(R_drawable, "msg_secret", 0)) or video_res
+                options.add(secret_res, "Скрытый кружок", R(lambda: self.pick_round(True)))
+            gravity = int(getattr(find_class("android.view.Gravity"), "RIGHT", 5))
+            options.setGravity(gravity).show()
+        except Exception as e:
+            log("circle: show_menu: %s" % e)
+
+    def pick_round(self, hidden):
+        try:
+            self.pending_round = True
+            self.pending_hidden = hidden
+            pv = PhotoViewerClass.getInstance()
+            if pv:
+                idx = get_private_field(pv, "currentIndex") or 0
+                images = get_private_field(pv, "imagesArrLocals")
+                if images and 0 <= idx < images.size():
+                    entry = images.get(idx)
+                    if entry:
+                        try:
+                            set_private_field(entry, "ttl", 0x7FFFFFFF if hidden else 0)
+                        except Exception:
+                            pass
+            self.trigger_send()
+        except Exception as e:
+            log("circle: pick_round: %s" % e)
+
+    def trigger_send(self):
+        try:
+            pv = PhotoViewerClass.getInstance()
+            if not pv:
+                return
+            pv_class = _to_class(PhotoViewerClass)
+            Boolean_TYPE = find_class("java.lang.Boolean").TYPE
+            Integer_TYPE = find_class("java.lang.Integer").TYPE
+            for sig, sargs in (
+                ([Boolean_TYPE, Integer_TYPE, Integer_TYPE], [True, 0, 0]),
+                ([Boolean_TYPE, Integer_TYPE, Integer_TYPE, Boolean_TYPE, Boolean_TYPE, Boolean_TYPE],
+                 [True, 0, 0, False, False, False]),
+            ):
+                try:
+                    m = pv_class.getDeclaredMethod("sendPressed", *sig)
+                    m.setAccessible(True)
+                    m.invoke(pv, self.wrap_args(m, sargs))
+                    return
+                except Exception:
+                    continue
+            log("circle: sendPressed not found")
+        except Exception as e:
+            log("circle: trigger_send: %s" % e)
+
+    def wrap_args(self, method, args):
+        Integer = find_class("java.lang.Integer")
+        Boolean = find_class("java.lang.Boolean")
+        Long = find_class("java.lang.Long")
+        Object = find_class("java.lang.Object")
+        ptypes = method.getParameterTypes()
+        wrapped = []
+        for i, x in enumerate(args):
+            if i >= len(ptypes):
+                wrapped.append(x)
+                continue
+            t = ptypes[i].getName()
+            if t == "long":
+                wrapped.append(Long(int(x)))
+            elif t == "int":
+                wrapped.append(Integer(int(x)))
+            elif t == "boolean":
+                wrapped.append(Boolean(bool(x)))
+            else:
+                wrapped.append(x)
+        return jarray(Object)(wrapped)
+
+    def create_settings(self):
+        return [
+            Header(text="Circle Send"),
+            Switch(
+                key="show_hidden",
+                text="Пункт «Скрытый кружок»",
+                default=True,
+                subtext="Кружок, который исчезает после просмотра",
+                icon="msg_secret",
+            ),
+            Text(
+                text="Как пользоваться",
+                subtext="Открой видео в галерее → зажми кнопку «Отправить» → «Кружок»",
+                icon="msg_info",
+            ),
+        ]
